@@ -1092,10 +1092,14 @@ const KRITERIA = [
 ];
 
 // Pairwise tersimpan di backend (simulasi). UI tidak menampilkan proses pairwise.
+// Bobot dirancang seimbang agar ketiga strategi bisa bersaing secara realistis:
+// - Admin: mementingkan utilisasi ruang (C3 > C1 > C2)
+// - Dosen: mementingkan preferensi waktu (C2 > C3 > C1)
+// - Mahasiswa: mementingkan kenyamanan jadwal (C1 > C2 ≈ C3)
 const HIDDEN_PAIRWISE = {
-  admin:     { c1c2: 1,   c1c3: 1/3, c2c3: 1/3 },
-  dosen:     { c1c2: 1/3, c1c3: 1,   c2c3: 3   },
-  mahasiswa: { c1c2: 3,   c1c3: 3,   c2c3: 1   }
+  admin:     { c1c2: 1,   c1c3: 1/2, c2c3: 1/2 },
+  dosen:     { c1c2: 1/3, c1c3: 1/2, c2c3: 2   },
+  mahasiswa: { c1c2: 2,   c1c3: 2,   c2c3: 1   }
 };
 
 // Tabel kesesuaian preferensi dosen vs slot
@@ -1263,10 +1267,11 @@ function generateGreedy(strategi) {
 
 // Hitung skor C1 (Idle Time Mahasiswa) untuk satu jadwal
 function hitungSkorC1(jadwal) {
-  const SLOT_START = [480, 600, 780, 900]; // dalam menit (08:00, 10:00, 13:00, 15:00)
-  const SLOT_END   = [580, 700, 880, 1000]; // 09:40, 11:40, 14:40, 16:40
+  // 5 slot: 07:00-08:40, 09:00-10:40, 11:00-12:40, 13:30-15:10, 15:30-17:10
+  const SLOT_START = [420, 540, 660, 810, 930]; // dalam menit
+  const SLOT_END   = [520, 640, 760, 910, 1030];
   const TOLERANSI = 60;
-  const WORST_CASE = 320; // 08:00-09:40 dan 15:00-16:40 (idle 320 menit)
+  const WORST_CASE = 510; // 07:00-08:40 dan 15:30-17:10 (idle max ~510 menit)
 
   let totalSkor = 0;
   let count = 0;
@@ -1498,9 +1503,8 @@ function randomPreferensiDosenSet() {
   const opsi = ['pagi', 'siang', 'sore', 'fleksibel'];
   const result = {};
   MASTER.dosen.forEach(d => {
-    // 70% kemungkinan tetap dengan preferensi aslinya, 30% berubah
-    // (mensimulasikan dosen yang preferensinya bergeser antar periode)
-    if (Math.random() < 0.7) {
+    // 50% tetap, 50% berubah — variasi lebih besar antar periode
+    if (Math.random() < 0.5) {
       result[d.id] = d.preferensi;
     } else {
       result[d.id] = opsi[Math.floor(Math.random() * opsi.length)];
@@ -1510,16 +1514,54 @@ function randomPreferensiDosenSet() {
 }
 
 function randomJumlahMhsSet() {
-  // Fluktuasi ±20% dari jumlah_mhs asli per kelas, dibulatkan
+  // Fluktuasi ±30% dari jumlah_mhs asli per kelas
   const result = {};
   MASTER.kelas.forEach(k => {
-    const delta = (Math.random() * 0.4 - 0.2); // -20% .. +20%
+    const delta = (Math.random() * 0.6 - 0.3); // -30% .. +30%
     result[k.id] = Math.max(10, Math.round(k.jumlah_mhs * (1 + delta)));
   });
   return result;
 }
 
-// Versi hitungSkorC2/C3 yang menerima override (supaya tidak merusak
+// Versi C1 dengan variasi acak ringan per periode (simulasi kondisi berbeda antar semester:
+// absensi, kelas pengganti, jadwal bergeser, dll.)
+function hitungSkorC1Override(jadwal, variasiFaktor) {
+  const SLOT_START = [420, 540, 660, 810, 930];
+  const SLOT_END   = [520, 640, 760, 910, 1030];
+  const TOLERANSI = 60;
+  const WORST_CASE = 510;
+
+  let totalSkor = 0;
+  let count = 0;
+
+  for (const kelas of MASTER.kelas) {
+    for (let h = 0; h < 5; h++) {
+      const mkHariIni = jadwal.filter(j => j.kelas === kelas.id && j.hari_idx === h);
+      if (mkHariIni.length < 2) continue;
+
+      mkHariIni.sort((a, b) => a.jam_idx - b.jam_idx);
+      let totalIdle = 0;
+      for (let i = 0; i < mkHariIni.length - 1; i++) {
+        const idle = SLOT_START[mkHariIni[i+1].jam_idx] - SLOT_END[mkHariIni[i].jam_idx];
+        totalIdle += idle;
+      }
+      // Variasi: tambah/kurangi idle efektif berdasarkan faktor acak per periode
+      const idleEfektif = Math.max(0, totalIdle * variasiFaktor - TOLERANSI);
+      const skor = Math.max(0, 1 - idleEfektif / WORST_CASE);
+      totalSkor += skor;
+      count++;
+    }
+  }
+
+  const totalKelasHari = MASTER.kelas.length * 5;
+  const kelasHariSatuMK = totalKelasHari - count;
+  totalSkor += kelasHariSatuMK * 1.0;
+  count = totalKelasHari;
+
+  return count > 0 ? totalSkor / count : 0;
+}
+
+
 // fungsi asli yang dipakai oleh pipeline single-run ETS)
 function hitungSkorC2Override(jadwal, prefSet) {
   let total = 0;
@@ -1554,10 +1596,15 @@ function simulasiSatuPeriode(periodeId, kandidatBase) {
   const prefSet = randomPreferensiDosenSet();
   const mhsSet = randomJumlahMhsSet();
 
+  // Faktor variasi C1 per periode: mensimulasikan kondisi nyata antar semester
+  // (jadwal bergeser, ada kelas pengganti, absensi tinggi, dll.)
+  // Range 0.7 – 1.3 (±30% variasi idle time antar periode)
+  const c1Faktor = 0.7 + Math.random() * 0.6;
+
   const evalSatu = (jadwal, label) => ({
     label,
     skor: {
-      c1: hitungSkorC1(jadwal), // idle time tidak dipengaruhi preferensi/kapasitas
+      c1: hitungSkorC1Override(jadwal, c1Faktor),
       c2: hitungSkorC2Override(jadwal, prefSet),
       c3: hitungSkorC3Override(jadwal, mhsSet)
     }
@@ -2828,18 +2875,29 @@ function renderPrediksiKonflik() {
 
     // ── Deteksi real dari hasil generator (STATE.kandidat) ──────────
     if (STATE.kandidat) {
-      const winnerLabel = STATE.topsisResult ? STATE.topsisResult.winner.label : 'K1';
+      // Tentukan pemenang dari Vpref (bukan .winner yang tidak ada di STATE)
+      let winnerLabel = 'K1';
+      if (STATE.topsisResult) {
+        const vpref = STATE.topsisResult.topsis.Vpref;
+        const labels = ['K1', 'K2', 'K3'];
+        let maxV = -1;
+        vpref.forEach((v, i) => { if (v > maxV) { maxV = v; winnerLabel = labels[i]; } });
+      }
       const jadwal = STATE.kandidat[winnerLabel]?.jadwal || [];
+
+      // Helper: label hari dan sesi
+      const hariLabel = (h) => (MASTER.hari && MASTER.hari[h]) || `Hari-${h+1}`;
+      const sesiLabel = (j) => (MASTER.slot && MASTER.slot[j]) ? MASTER.slot[j].label : `Sesi-${j+1}`;
 
       // Dosen double-booking
       const dosenSlots = {};
       jadwal.forEach(slot => {
-        const key = `${slot.dosen}_${slot.hari}_${slot.sesi}`;
+        const key = `${slot.dosen}_${slot.hari_idx}_${slot.jam_idx}`;
         if (dosenSlots[key]) {
           konflik.push({
             sev: 'high', icon: '👨‍🏫',
             title: `Double-booking Dosen ${slot.dosen}`,
-            detail: `${slot.dosen} terdeteksi dijadwalkan lebih dari 1 MK pada ${slot.hari} sesi ${slot.sesi} di jadwal pemenang ${winnerLabel}.`,
+            detail: `${slot.dosen} terdeteksi dijadwalkan lebih dari 1 MK pada ${hariLabel(slot.hari_idx)} ${sesiLabel(slot.jam_idx)} di jadwal pemenang ${winnerLabel}.`,
             badge: 'KRITIS', bc: 'kb-high'
           });
         }
@@ -2849,12 +2907,12 @@ function renderPrediksiKonflik() {
       // Ruang double-booking
       const ruangSlots = {};
       jadwal.forEach(slot => {
-        const key = `${slot.ruang_id}_${slot.hari}_${slot.sesi}`;
+        const key = `${slot.ruang_id}_${slot.hari_idx}_${slot.jam_idx}`;
         if (ruangSlots[key]) {
           konflik.push({
             sev: 'high', icon: '🏫',
             title: `Konflik Ruang ${slot.ruang_id}`,
-            detail: `Ruang ${slot.ruang_id} dipakai oleh lebih dari 1 MK pada ${slot.hari} sesi ${slot.sesi}.`,
+            detail: `Ruang ${slot.ruang_id} dipakai oleh lebih dari 1 MK pada ${hariLabel(slot.hari_idx)} ${sesiLabel(slot.jam_idx)}.`,
             badge: 'KRITIS', bc: 'kb-high'
           });
         }
@@ -2864,12 +2922,12 @@ function renderPrediksiKonflik() {
       // Kelas double-booking
       const kelasSlots = {};
       jadwal.forEach(slot => {
-        const key = `${slot.kelas}_${slot.hari}_${slot.sesi}`;
+        const key = `${slot.kelas}_${slot.hari_idx}_${slot.jam_idx}`;
         if (kelasSlots[key]) {
           konflik.push({
             sev: 'high', icon: '🎓',
             title: `Kelas ${slot.kelas} Ganda di Slot yang Sama`,
-            detail: `Kelas ${slot.kelas} memiliki lebih dari 1 MK di ${slot.hari} sesi ${slot.sesi}.`,
+            detail: `Kelas ${slot.kelas} memiliki lebih dari 1 MK di ${hariLabel(slot.hari_idx)} ${sesiLabel(slot.jam_idx)}.`,
             badge: 'KRITIS', bc: 'kb-high'
           });
         }
@@ -2922,7 +2980,7 @@ function renderPrediksiKonflik() {
           konflik.push({
             sev: 'low', icon: '🔄',
             title: `Preferensi Dosen ${slot.dosen} Tidak Terpenuhi`,
-            detail: `${dosen?.nama || slot.dosen} (preferensi ${pref}) dijadwalkan di sesi ke-${jamIdx+1} pada ${slot.hari} — kesesuaian hanya ${(score*100).toFixed(0)}%.`,
+            detail: `${dosen?.nama || slot.dosen} (preferensi ${pref}) dijadwalkan di sesi ke-${jamIdx+1} pada ${hariLabel(slot.hari_idx)} — kesesuaian hanya ${(score*100).toFixed(0)}%.`,
             badge: 'RENDAH', bc: 'kb-low'
           });
         }
@@ -3186,9 +3244,14 @@ function navigateTo(page) {
 
 function handleRunBigData() {
   const input = document.getElementById('nPeriode');
-  let n = parseInt(input.value, 10);
+  let n = input ? parseInt(input.value, 10) : 500;
   if (isNaN(n) || n < 50) n = 50;
   if (n > 5000) n = 5000;
+
+  // Reset historicalDataset agar benar-benar generate ulang dengan N yang baru
+  STATE.historicalDataset = null;
+  STATE.historicalStats = null;
+
   runBigDataPipeline(n);
   showToast(`Berhasil membangkitkan & menganalisis ${n} periode historis`);
   render();
